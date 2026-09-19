@@ -15,7 +15,13 @@
  *   状态，不触发快进/冲突回调、不残留已保存节点，存储恢复后同一消息可
  *   原样重试（不会被误判为重复消息）；BroadcastChannel 与 storage 事件
  *   两条入口走同一事务路径；
- * - 同步判定只看修订图的祖先关系，禁止按时间戳覆盖：
+ * - 修订全集有上限（MAX_REVISIONS）：超出后从最早修订开始裁剪，但裁剪
+ *   不是彻底删除——每个被裁节点留下一条**祖先摘要**（骨架：id + 父链），
+ *   与修订全集一起随单键状态原子持久化（写入失败同样整体回滚）；摘要
+ *   同样有上限（MAX_SKELETONS），超出后淘汰最老摘要。关系判定沿全量
+ *   节点与骨架共同遍历父链：旧标签页迟到广播的已裁剪祖先仍可被证明为
+ *   过时（stale），只有真正分叉（或祖先链彻底缺失无法证明）才进入冲突；
+ * - 同步判定只看修订图的祖先关系（含祖先摘要），禁止按时间戳覆盖：
  *   - 当前 head 是收到修订的祖先 → 快进；
  *   - 收到修订是当前 head 的祖先 → 忽略；
  *   - 互不为祖先（或祖先链缺失无法证明）→ 分叉冲突，保留两份；
@@ -31,17 +37,35 @@ export interface Revision {
   plan: Plan;
 }
 
+/**
+ * 被裁剪修订的祖先摘要（骨架）：仅保留 id 与父链，不携带 Plan。
+ * 裁剪不丢弃祖先信息，旧标签页迟到广播的已裁剪祖先仍可被证明为过时，
+ * 而不是因父链缺口被误判为分叉。
+ */
+export interface RevisionSkeleton {
+  id: string;
+  parentRevisionIds: string[];
+}
+
 /** 持久化在单个 localStorage 键中的完整持久化状态（原子替换单位）。 */
 interface PersistedState {
   version: 2;
   headId: string;
   revisions: Revision[];
+  /** 被裁剪修订的祖先摘要；既有 version 2 文档可能缺失该字段（按空数组解析）。 */
+  skeletons: RevisionSkeleton[];
 }
 
 /** 修订数组解析结果（新键与旧版双键共用）。 */
 interface ParsedRevisions {
   revisions: Revision[];
   badCount: number;
+}
+
+/** 祖先摘要数组解析结果。 */
+interface ParsedSkeletons {
+  skeletons: RevisionSkeleton[];
+  badSkeletonCount: number;
 }
 
 /** 新键：修订全集与 head 指针收敛后的单一原子状态文档。 */
@@ -51,8 +75,15 @@ export const REVISIONS_STORAGE_KEY = 'ipv4-subnet-planner/revisions/v1';
 export const HEAD_STORAGE_KEY = 'ipv4-subnet-planner/head/v1';
 export const CHANNEL_NAME = 'ipv4-subnet-planner/revisions/v1';
 
-/** 修订全集上限，超出后从最早的修订开始裁剪（head 与冲突分支最后裁剪）。 */
-const MAX_REVISIONS = 400;
+/** 修订全集上限，超出后从最早的修订开始裁剪为祖先摘要（head 与冲突分支最后裁剪）。 */
+export const MAX_REVISIONS = 400;
+
+/**
+ * 祖先摘要（骨架）上限：被裁剪的全量修订只保留 id + 父链，持久化文档
+ * 因此不会随历史无限增长；超出后淘汰最老摘要，更古老的祖先将无法证明，
+ * 关系判定保守回退为分叉。
+ */
+export const MAX_SKELETONS = 2000;
 
 /** 所有客户端共享的空规划创世修订 id（内容恒定，无需随机）。 */
 export const GENESIS_REVISION_ID = 'genesis:empty-plan:v1';
@@ -69,11 +100,16 @@ export type CommitResult =
   | { ok: true; revision: Revision }
   | { ok: false; reason: 'conflict-locked' | 'storage-error'; message: string };
 
-/** 沿 parentRevisionIds 判断 maybeAncestor 是否为 descendant 的祖先（含父链缺失即终止）。 */
+/**
+ * 沿 parentRevisionIds 判断 maybeAncestor 是否为 descendant 的祖先。
+ * 全量修订之外还可查阅祖先摘要（骨架）：被裁剪节点仍能提供父链；
+ * 父链彻底缺失（从未收到或摘要已淘汰）时无法继续证明，返回 false。
+ */
 export function isAncestor(
   maybeAncestorId: string,
   descendantId: string,
   revisions: ReadonlyMap<string, Revision>,
+  skeletons?: ReadonlyMap<string, RevisionSkeleton>,
 ): boolean {
   if (maybeAncestorId === descendantId) return true;
   const seen = new Set<string>();
@@ -82,9 +118,10 @@ export function isAncestor(
     const id = stack.pop()!;
     if (seen.has(id)) continue;
     seen.add(id);
-    const rev = revisions.get(id);
-    if (!rev) continue; // 父链上的修订已被裁剪：无法继续证明祖先关系
-    for (const parent of rev.parentRevisionIds) {
+    const parents =
+      revisions.get(id)?.parentRevisionIds ?? skeletons?.get(id)?.parentRevisionIds;
+    if (!parents) continue; // 父链缺失：无法继续证明祖先关系
+    for (const parent of parents) {
       if (parent === maybeAncestorId) return true;
       if (!seen.has(parent)) stack.push(parent);
     }
@@ -93,17 +130,18 @@ export function isAncestor(
 }
 
 /**
- * 按修订图判定 remote 相对当前 head 的关系。
+ * 按修订图判定 remote 相对当前 head 的关系（全量节点与祖先摘要共同遍历）。
  * 创世空规划使用全局固定 id，空存储的标签页之间自然收敛到同一节点。
  */
 export function relationOf(
   headId: string,
   remoteId: string,
   revisions: ReadonlyMap<string, Revision>,
+  skeletons?: ReadonlyMap<string, RevisionSkeleton>,
 ): RevisionRelation {
   if (headId === remoteId) return 'same';
-  if (isAncestor(headId, remoteId, revisions)) return 'fast-forward';
-  if (isAncestor(remoteId, headId, revisions)) return 'stale';
+  if (isAncestor(headId, remoteId, revisions, skeletons)) return 'fast-forward';
+  if (isAncestor(remoteId, headId, revisions, skeletons)) return 'stale';
   return 'diverged';
 }
 
@@ -161,8 +199,39 @@ function parseRevisionsArray(items: unknown[]): ParsedRevisions {
   return { revisions, badCount };
 }
 
-/** 解析单键原子状态文档（version 2）。 */
-function parsePersistedState(raw: string): ParseResult<ParsedRevisions & { headId: unknown }> {
+/** 解析祖先摘要数组：结构损坏或重复的条目跳过并计数，绝不抛出。 */
+function parseSkeletonsArray(items: unknown[]): ParsedSkeletons {
+  const skeletons: RevisionSkeleton[] = [];
+  const seen = new Set<string>();
+  let badSkeletonCount = 0;
+  for (const item of items) {
+    if (
+      !isRecord(item) ||
+      typeof item.id !== 'string' ||
+      item.id.length === 0 ||
+      !Array.isArray(item.parentRevisionIds) ||
+      !item.parentRevisionIds.every((p) => typeof p === 'string')
+    ) {
+      badSkeletonCount += 1;
+      continue;
+    }
+    if (seen.has(item.id)) {
+      badSkeletonCount += 1;
+      continue;
+    }
+    seen.add(item.id);
+    skeletons.push({
+      id: item.id,
+      parentRevisionIds: [...(item.parentRevisionIds as string[])],
+    });
+  }
+  return { skeletons, badSkeletonCount };
+}
+
+/** 解析单键原子状态文档（version 2；祖先摘要字段缺失时按空数组兼容）。 */
+function parsePersistedState(
+  raw: string,
+): ParseResult<ParsedRevisions & ParsedSkeletons & { headId: unknown }> {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -173,7 +242,13 @@ function parsePersistedState(raw: string): ParseResult<ParsedRevisions & { headI
     return { ok: false, error: '本地状态文档结构损坏' };
   }
   const parsed = parseRevisionsArray(json.revisions as unknown[]);
-  return { ok: true, value: { ...parsed, headId: json.headId } };
+  const skeletons: ParsedSkeletons =
+    json.skeletons === undefined
+      ? { skeletons: [], badSkeletonCount: 0 }
+      : Array.isArray(json.skeletons)
+        ? parseSkeletonsArray(json.skeletons as unknown[])
+        : { skeletons: [], badSkeletonCount: 1 };
+  return { ok: true, value: { ...parsed, ...skeletons, headId: json.headId } };
 }
 
 /** 解析旧版修订全集文档（version 1，双键时代）。 */
@@ -214,6 +289,10 @@ export class RevisionSync {
   private revisions = new Map<string, Revision>();
   /** 文档内的原始顺序，用于裁剪时从最早修订开始丢弃。 */
   private order: string[] = [];
+  /** 被裁剪修订的祖先摘要（骨架）：随单键状态原子持久化，与全量节点不共存同 id。 */
+  private skeletons = new Map<string, RevisionSkeleton>();
+  /** 骨架的保序队列：超出上限时从最早的摘要开始淘汰。 */
+  private skeletonOrder: string[] = [];
   private headId: string;
   private readonly clientId: string;
   private readonly storage: Storage | null;
@@ -280,6 +359,12 @@ export class RevisionSync {
         if (doc.value.badCount > 0) {
           handlers.onWarning(`收到的修订中有 ${doc.value.badCount} 个损坏快照，已忽略`);
         }
+        if (doc.value.badSkeletonCount > 0) {
+          handlers.onWarning(`收到的祖先摘要中有 ${doc.value.badSkeletonCount} 个损坏条目，已忽略`);
+        }
+        // 先并入对方文档中的祖先摘要，再接收修订：即使对方已裁剪、本页未持有
+        // 的祖先，关系判定也能跨摘要证明，避免父链缺口造成的误分叉。
+        sync.mergeSkeletons(doc.value.skeletons);
         for (const rev of doc.value.revisions) sync.ingest(rev);
       };
       window.addEventListener('storage', listener);
@@ -338,8 +423,7 @@ export class RevisionSync {
       plan,
     };
     return this.transact(() => {
-      this.revisions.set(rev.id, rev);
-      this.order.push(rev.id);
+      this.addRevisionNode(rev);
       this.headId = rev.id;
     }, () => this.post(rev));
   }
@@ -359,8 +443,7 @@ export class RevisionSync {
       plan,
     };
     return this.transact(() => {
-      this.revisions.set(rev.id, rev);
-      this.order.push(rev.id);
+      this.addRevisionNode(rev);
       this.headId = rev.id;
       this.conflictId = null;
     }, () => this.post(rev));
@@ -398,21 +481,31 @@ export class RevisionSync {
       // 重复投递（storage 事件与频道消息可能各来一次）：无需再判定。
       return;
     }
+    if (
+      this.skeletons.has(rev.id) &&
+      relationOf(this.headId, rev.id, this.revisions, this.skeletons) === 'stale'
+    ) {
+      // 本页曾持有并已裁剪该修订（旧标签页迟到补发已裁剪链上的祖先）：
+      // 祖先摘要已能证明它是当前 head 的祖先，直接按过时忽略——骨架保留了
+      // 判定所需的全部祖先信息，无需重新入库，也不产生任何落盘与回调。
+      // （证明不了过时的——例如真实分叉的侧枝——继续走下方完整接收事务。）
+      return;
+    }
     if (this.conflictId !== null) {
       const conflictId = this.conflictId;
       // 在候选图（含新修订）上预判：对方是否已提交同时覆盖本页 head 与冲突
       // 版本的合并修订。判定本身是纯计算，不触碰内存。
       const candidateRevisions = new Map(this.revisions);
       candidateRevisions.set(rev.id, rev);
-      const relHead = relationOf(this.headId, rev.id, candidateRevisions);
+      const relHead = relationOf(this.headId, rev.id, candidateRevisions, this.skeletons);
       const resolvesConflict =
-        relHead === 'fast-forward' && isAncestor(conflictId, rev.id, candidateRevisions);
+        relHead === 'fast-forward' &&
+        isAncestor(conflictId, rev.id, candidateRevisions, this.skeletons);
 
       if (resolvesConflict) {
         const pending = [...this.pendingIds];
         const result = this.transact(() => {
-          this.revisions.set(rev.id, rev);
-          this.order.push(rev.id);
+          this.addRevisionNode(rev);
           this.headId = rev.id;
           this.conflictId = null;
           this.pendingIds = [];
@@ -433,8 +526,7 @@ export class RevisionSync {
       // 普通挂起修订：只需持久化“图中多一个节点”，head/冲突状态不变。
       // 失败时由 transact 快照整体回滚（节点、pending 队列均不保留）。
       const result = this.transact(() => {
-        this.revisions.set(rev.id, rev);
-        this.order.push(rev.id);
+        this.addRevisionNode(rev);
         if (!this.pendingIds.includes(rev.id)) this.pendingIds.push(rev.id);
       });
       if (!result.ok) {
@@ -450,9 +542,8 @@ export class RevisionSync {
     let relation: RevisionRelation = 'stale';
     const result = this.transact(
       () => {
-        this.revisions.set(rev.id, rev);
-        this.order.push(rev.id);
-        relation = relationOf(this.headId, rev.id, this.revisions);
+        this.addRevisionNode(rev);
+        relation = relationOf(this.headId, rev.id, this.revisions, this.skeletons);
         if (relation === 'fast-forward') {
           this.headId = rev.id;
         } else if (relation === 'diverged') {
@@ -477,7 +568,7 @@ export class RevisionSync {
    * 新接收的修订不走这里（见 ingest 的单事务路径）。
    */
   private classify(rev: Revision): void {
-    const relation = relationOf(this.headId, rev.id, this.revisions);
+    const relation = relationOf(this.headId, rev.id, this.revisions, this.skeletons);
     if (relation === 'same' || relation === 'stale') return;
     if (relation === 'fast-forward') {
       // 快进同样必须先落盘：head 切换与 onFastForward（界面历史更新）
@@ -525,8 +616,14 @@ export class RevisionSync {
         this.revisions.set(rev.id, rev);
         this.order.push(rev.id);
       }
+      // 祖先摘要随同一文档恢复（既有 version 2 文档无此字段时为空）；
+      // 须在 head 校验/恢复之前并入，恢复逻辑同样沿骨架遍历父链。
+      this.mergeSkeletons(doc.value.skeletons);
       if (doc.value.badCount > 0) {
         warnings.push(`检测到 ${doc.value.badCount} 个损坏的修订快照，已忽略`);
+      }
+      if (doc.value.badSkeletonCount > 0) {
+        warnings.push(`检测到 ${doc.value.badSkeletonCount} 个损坏的祖先摘要，已忽略`);
       }
       if (typeof doc.value.headId === 'string' && this.revisions.has(doc.value.headId)) {
         return { headId: doc.value.headId, warnings, migratedFromLegacy: false };
@@ -598,7 +695,7 @@ export class RevisionSync {
     for (const id of this.revisions.keys()) {
       let hasDescendant = false;
       for (const other of this.revisions.values()) {
-        if (other.id !== id && isAncestor(id, other.id, this.revisions)) {
+        if (other.id !== id && isAncestor(id, other.id, this.revisions, this.skeletons)) {
           hasDescendant = true;
           break;
         }
@@ -611,10 +708,12 @@ export class RevisionSync {
       const walk = (cur: string, trail: Set<string>): number => {
         const cached = memo.get(cur);
         if (cached !== undefined) return cached;
-        const rev = this.revisions.get(cur);
-        if (!rev || rev.parentRevisionIds.length === 0 || trail.has(cur)) return 0;
+        // 全量节点之外沿祖先摘要继续回溯，裁剪区也计入链长。
+        const parents =
+          this.revisions.get(cur)?.parentRevisionIds ?? this.skeletons.get(cur)?.parentRevisionIds;
+        if (!parents || parents.length === 0 || trail.has(cur)) return 0;
         trail.add(cur);
-        const d = 1 + Math.max(...rev.parentRevisionIds.map((p) => walk(p, trail)));
+        const d = 1 + Math.max(...parents.map((p) => walk(p, trail)));
         trail.delete(cur);
         memo.set(cur, d);
         return d;
@@ -633,6 +732,8 @@ export class RevisionSync {
     const snapshot = {
       revisions: new Map(this.revisions),
       order: [...this.order],
+      skeletons: new Map(this.skeletons),
+      skeletonOrder: [...this.skeletonOrder],
       headId: this.headId,
       conflictId: this.conflictId,
       pendingIds: [...this.pendingIds],
@@ -642,6 +743,8 @@ export class RevisionSync {
     if (!result.ok) {
       this.revisions = snapshot.revisions;
       this.order = snapshot.order;
+      this.skeletons = snapshot.skeletons;
+      this.skeletonOrder = snapshot.skeletonOrder;
       this.headId = snapshot.headId;
       this.conflictId = snapshot.conflictId;
       this.pendingIds = snapshot.pendingIds;
@@ -652,8 +755,8 @@ export class RevisionSync {
   }
 
   /**
-   * 把当前完整状态（修订全集 + head 指针）序列化为单个文档，一次 setItem
-   * 原子替换。无存储后端时视为成功（纯频道/内存模式）。
+   * 把当前完整状态（修订全集 + 祖先摘要 + head 指针）序列化为单个文档，
+   * 一次 setItem 原子替换。无存储后端时视为成功（纯频道/内存模式）。
    * migrateLegacy=true 时（旧双键数据首次迁移）在新键写入成功后尽力删除旧键。
    */
   private writeState(migrateLegacy: boolean):
@@ -665,6 +768,7 @@ export class RevisionSync {
       version: 2,
       headId: this.headId,
       revisions: this.order.map((id) => this.revisions.get(id)!),
+      skeletons: this.skeletonOrder.map((id) => this.skeletons.get(id)!),
     };
     try {
       this.storage.setItem(STATE_STORAGE_KEY, JSON.stringify(state));
@@ -687,14 +791,55 @@ export class RevisionSync {
     return { ok: true };
   }
 
-  /** 超出上限时按文档顺序从最早修订开始裁剪；head 与冲突分支最后被丢弃。 */
+  /** 全量节点入库：同 id 的祖先摘要（若有）随之移除——全量节点取代骨架。 */
+  private addRevisionNode(rev: Revision): void {
+    this.revisions.set(rev.id, rev);
+    this.order.push(rev.id);
+    this.removeSkeleton(rev.id);
+  }
+
+  /** 为被裁剪的修订保留祖先摘要；全量节点与摘要不共存同 id。 */
+  private addSkeleton(id: string, parentRevisionIds: string[]): void {
+    if (this.revisions.has(id) || this.skeletons.has(id)) return;
+    this.skeletons.set(id, { id, parentRevisionIds: [...parentRevisionIds] });
+    this.skeletonOrder.push(id);
+  }
+
+  private removeSkeleton(id: string): void {
+    if (!this.skeletons.delete(id)) return;
+    const idx = this.skeletonOrder.indexOf(id);
+    if (idx >= 0) this.skeletonOrder.splice(idx, 1);
+  }
+
+  /**
+   * 并入外部状态文档中的祖先摘要（启动加载与 storage 事件共用）：
+   * 已是全量节点或已有摘要的 id 跳过；摘要只增不减，纯粹增强可证明性。
+   */
+  private mergeSkeletons(entries: RevisionSkeleton[]): void {
+    for (const entry of entries) {
+      this.addSkeleton(entry.id, entry.parentRevisionIds);
+    }
+  }
+
+  /**
+   * 超出上限时按文档顺序从最早修订开始裁剪；head 与冲突分支最后被丢弃。
+   * 裁剪不是彻底删除：每个被裁节点留下祖先摘要（id + 父链），旧标签页
+   * 迟到广播的已裁剪祖先仍可被证明为过时；摘要超出自身上限时淘汰最老
+   * 摘要（更古老的祖先将无法证明，关系判定保守回退为分叉）。
+   */
   private prune(): void {
     while (this.order.length > MAX_REVISIONS) {
       const protectedId = this.conflictId;
       const idx = this.order.findIndex((id) => id !== this.headId && id !== protectedId);
       if (idx < 0) break;
       const [removed] = this.order.splice(idx, 1);
+      const rev = this.revisions.get(removed);
       this.revisions.delete(removed);
+      if (rev) this.addSkeleton(rev.id, rev.parentRevisionIds);
+    }
+    while (this.skeletonOrder.length > MAX_SKELETONS) {
+      const dropped = this.skeletonOrder.shift()!;
+      this.skeletons.delete(dropped);
     }
   }
 }

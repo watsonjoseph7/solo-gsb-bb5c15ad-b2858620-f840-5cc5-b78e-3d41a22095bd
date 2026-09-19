@@ -2,9 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   GENESIS_REVISION_ID,
   HEAD_STORAGE_KEY,
+  MAX_REVISIONS,
+  MAX_SKELETONS,
   REVISIONS_STORAGE_KEY,
   STATE_STORAGE_KEY,
   Revision,
+  RevisionSkeleton,
   RevisionSync,
   isAncestor,
   parseRevision,
@@ -58,7 +61,12 @@ class FailingStorage extends MemStorage {
 }
 
 /** 读取单键原子状态文档。 */
-function readState(storage: Storage): { version: number; headId: string; revisions: Revision[] } {
+function readState(storage: Storage): {
+  version: number;
+  headId: string;
+  revisions: Revision[];
+  skeletons: RevisionSkeleton[];
+} {
   return JSON.parse(storage.getItem(STATE_STORAGE_KEY)!);
 }
 
@@ -382,6 +390,236 @@ describe('修订图祖先判定', () => {
     revs.set('x', { id: 'x', parentRevisionIds: ['gone'], clientId: 'c', plan: emptyPlan() });
     revs.set('y', { id: 'y', parentRevisionIds: ['gone'], clientId: 'c', plan: emptyPlan() });
     expect(relationOf('x', 'y', revs)).toBe('diverged');
+  });
+});
+
+describe('修订图裁剪与祖先摘要（超过上限后的关系判定）', () => {
+  /** 连续提交 n 次普通修订（全部应成功）。 */
+  const commitMany = (s: RevisionSync, n: number, tag: string): void => {
+    for (let i = 0; i < n; i++) {
+      expect(s.commit(rootOnlyPlan(`${tag}-${i}`)).ok).toBe(true);
+    }
+  };
+
+  it('祖先摘要（骨架）可跨裁剪区证明祖先关系，未知节点仍保守判分叉', () => {
+    // genesis、a 已被裁剪为骨架，b、c 仍是全量节点
+    const revs = new Map<string, Revision>();
+    revs.set('b', { id: 'b', parentRevisionIds: ['a'], clientId: 'c', plan: emptyPlan() });
+    revs.set('c', { id: 'c', parentRevisionIds: ['b'], clientId: 'c', plan: emptyPlan() });
+    const skeletons = new Map<string, RevisionSkeleton>([
+      ['genesis', { id: 'genesis', parentRevisionIds: [] }],
+      ['a', { id: 'a', parentRevisionIds: ['genesis'] }],
+    ]);
+    expect(isAncestor('a', 'c', revs, skeletons)).toBe(true);
+    expect(isAncestor('genesis', 'c', revs, skeletons)).toBe(true);
+    expect(isAncestor('c', 'a', revs, skeletons)).toBe(false);
+    expect(relationOf('c', 'a', revs, skeletons)).toBe('stale');
+    expect(relationOf('a', 'c', revs, skeletons)).toBe('fast-forward');
+    // 最老骨架被淘汰后，genesis 仍可凭 a 的父链指针证明为祖先
+    skeletons.delete('genesis');
+    expect(relationOf('c', 'genesis', revs, skeletons)).toBe('stale');
+    // 彻底未知的节点（任何全量节点/骨架都不引用它）仍保守判为分叉
+    expect(relationOf('c', 'ghost', revs, skeletons)).toBe('diverged');
+    // 无骨架时的旧行为保持：父链缺口（a 缺失）使 genesis 无法证明 → 分叉
+    expect(relationOf('c', 'genesis', revs)).toBe('diverged');
+  });
+
+  it('修订数超过上限：最老修订裁为祖先摘要而非删除，持久化不突破上限', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('c1'));
+    const genesis = s.head.id;
+    commitMany(s, MAX_REVISIONS + 30, 'n');
+
+    const state = readState(storage);
+    // 全量修订不突破上限，head 指向最新修订
+    expect(state.revisions.length).toBeLessThanOrEqual(MAX_REVISIONS);
+    expect(state.headId).toBe(s.head.id);
+    // 最老的修订（含创世）被裁为祖先摘要而非彻底删除
+    expect(state.revisions.some((x) => x.id === genesis)).toBe(false);
+    // 摘要只含 id 与父链，不携带 Plan
+    expect(state.skeletons.find((k) => k.id === genesis)).toEqual({
+      id: genesis,
+      parentRevisionIds: [],
+    });
+
+    // 旧标签页补发已被裁剪的创世修订：判为过时并彻底忽略，不误报分叉
+    const docBefore = storage.getItem(STATE_STORAGE_KEY);
+    const headBefore = s.head.id;
+    (s as unknown as { ingest(rev: Revision): void }).ingest({
+      id: genesis,
+      parentRevisionIds: [],
+      clientId: 'c9',
+      plan: emptyPlan(),
+    });
+    expect(s.head.id).toBe(headBefore);
+    expect(r.conflicts).toHaveLength(0);
+    expect(r.ff).toHaveLength(0);
+    expect(s.inConflict).toBe(false);
+    expect(s.getRevision(genesis)).toBeUndefined(); // 不重新入库
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(docBefore); // 无任何落盘
+    s.destroy();
+  });
+
+  it('重载后收到旧标签页广播的已裁剪祖先：判为过时忽略，不再误报分叉冲突', async () => {
+    const storage = new MemStorage();
+    const r1 = rec();
+    const s1 = openSync(storage, 'c1', r1, counterUuid('c1'));
+    // 旧标签页当前持有的修订（随后会被继续的提交裁剪出全量集）
+    const first = s1.commit(rootOnlyPlan('old'));
+    expect(first.ok).toBe(true);
+    const oldRev = (first as { ok: true; revision: Revision }).revision;
+    commitMany(s1, MAX_REVISIONS + 10, 'x');
+    // 该修订已被裁剪为摘要并随单键状态持久化
+    expect(readState(storage).revisions.some((x) => x.id === oldRev.id)).toBe(false);
+    expect(readState(storage).skeletons.some((k) => k.id === oldRev.id)).toBe(true);
+    s1.destroy();
+
+    // 重载（新会话）：从单键文档恢复全量修订与祖先摘要
+    const r2 = rec();
+    const s2 = openSync(storage, 'c2', r2, counterUuid('c2'));
+    const headAfterReload = s2.head.id;
+    const docBefore = storage.getItem(STATE_STORAGE_KEY);
+    await flush();
+
+    // 旧标签页经广播补发已裁剪的祖先修订 → 应判 stale 并忽略
+    const sender = new FakeChannel('test');
+    sender.postMessage({ type: 'revision', revision: oldRev });
+    await flush();
+    expect(s2.head.id).toBe(headAfterReload);
+    expect(r2.conflicts).toHaveLength(0); // 修复前：父链缺口误判分叉并锁定编辑
+    expect(r2.ff).toHaveLength(0);
+    expect(s2.inConflict).toBe(false);
+    expect(s2.getRevision(oldRev.id)).toBeUndefined();
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(docBefore);
+    s2.destroy();
+    sender.close();
+  });
+
+  it('旧标签页基于已裁剪祖先的真实分叉编辑：仍判为分叉冲突', async () => {
+    const storage = new MemStorage();
+    const r1 = rec();
+    const s1 = openSync(storage, 'c1', r1, counterUuid('c1'));
+    const first = s1.commit(rootOnlyPlan('base'));
+    expect(first.ok).toBe(true);
+    const oldRev = (first as { ok: true; revision: Revision }).revision;
+    commitMany(s1, MAX_REVISIONS + 10, 'x');
+    expect(readState(storage).skeletons.some((k) => k.id === oldRev.id)).toBe(true);
+    s1.destroy();
+
+    const r2 = rec();
+    const s2 = openSync(storage, 'c2', r2, counterUuid('c2'));
+    await flush();
+
+    // 旧标签页在被裁剪的祖先之上做了新编辑（与本页链互不包含的真实分叉）
+    const sender = new FakeChannel('test');
+    const fork: Revision = {
+      id: 'fork-1',
+      parentRevisionIds: [oldRev.id],
+      clientId: 'c9',
+      plan: rootOnlyPlan('fork'),
+    };
+    sender.postMessage({ type: 'revision', revision: fork });
+    await flush();
+    expect(s2.inConflict).toBe(true);
+    expect(r2.conflicts.map((c) => c.id)).toEqual(['fork-1']);
+    // 分叉修订入库保留，等待人工合并
+    expect(s2.getRevision('fork-1')).toBeDefined();
+    expect(readState(storage).revisions.some((x) => x.id === 'fork-1')).toBe(true);
+    s2.destroy();
+    sender.close();
+  });
+
+  it('祖先摘要同样有界：超出后淘汰最老摘要，持久化不突破摘要上限', () => {
+    const storage = new MemStorage();
+    // 预置一份含 MAX_SKELETONS + 10 条摘要的合法文档
+    const skeletons: RevisionSkeleton[] = [];
+    for (let i = 1; i <= MAX_SKELETONS + 10; i++) {
+      skeletons.push({ id: `sk-${i}`, parentRevisionIds: i === 1 ? [] : [`sk-${i - 1}`] });
+    }
+    const tip: Revision = {
+      id: 'tip',
+      parentRevisionIds: [`sk-${MAX_SKELETONS + 10}`],
+      clientId: 'c',
+      plan: rootOnlyPlan('tip'),
+    };
+    storage.setItem(
+      STATE_STORAGE_KEY,
+      JSON.stringify({ version: 2, headId: 'tip', revisions: [tip], skeletons }),
+    );
+
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('c1'));
+    expect(s.head.id).toBe('tip');
+    // 一次提交触发落盘：摘要被裁剪到上限以内
+    expect(s.commit(rootOnlyPlan('next')).ok).toBe(true);
+    const state = readState(storage);
+    expect(state.skeletons.length).toBeLessThanOrEqual(MAX_SKELETONS);
+    // 最老的摘要被淘汰，较新的保留
+    expect(state.skeletons.some((k) => k.id === 'sk-1')).toBe(false);
+    expect(state.skeletons.some((k) => k.id === `sk-${MAX_SKELETONS + 10}`)).toBe(true);
+    s.destroy();
+  });
+
+  it('兼容无祖先摘要字段的既有 version 2 文档', () => {
+    const storage = new MemStorage();
+    storage.setItem(
+      STATE_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        headId: 'leaf',
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+          {
+            id: 'leaf',
+            parentRevisionIds: [GENESIS_REVISION_ID],
+            clientId: 'c',
+            plan: rootOnlyPlan('1'),
+          },
+        ],
+      }),
+    );
+    const r = rec();
+    const s = openSync(storage, 'c2', r, counterUuid('z'));
+    expect(s.head.id).toBe('leaf');
+    expect(r.warnings).toHaveLength(0);
+    // 提交后以带祖先摘要字段的形态写回（仍为 version 2）
+    expect(s.commit(rootOnlyPlan('2')).ok).toBe(true);
+    const state = readState(storage);
+    expect(state.version).toBe(2);
+    expect(state.skeletons).toEqual([]);
+    s.destroy();
+  });
+
+  it('触发裁剪的提交写入失败：全量修订与祖先摘要一并整体回滚', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('c1'));
+    commitMany(s, MAX_REVISIONS + 5, 'n');
+    const docBefore = storage.getItem(STATE_STORAGE_KEY);
+    const headBefore = s.head.id;
+    // 当前最老的全量修订：下一次提交会把它裁成摘要
+    const oldestRetained = readState(storage).revisions[0].id;
+    expect(s.getRevision(oldestRetained)).toBeDefined();
+
+    vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      const err = new Error('QuotaExceededError');
+      err.name = 'QuotaExceededError';
+      throw err;
+    });
+    const failed = s.commit(rootOnlyPlan('fail'));
+    expect(failed.ok).toBe(false);
+    // 内存与持久化整体回滚：head 未动、最老全量修订未被裁剪、文档未变
+    expect(s.head.id).toBe(headBefore);
+    expect(s.getRevision(oldestRetained)).toBeDefined();
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(docBefore);
+
+    // 存储恢复后重试成功：同一修订此时才被裁为摘要
+    vi.restoreAllMocks();
+    expect(s.commit(rootOnlyPlan('ok')).ok).toBe(true);
+    expect(s.getRevision(oldestRetained)).toBeUndefined();
+    expect(readState(storage).skeletons.some((k) => k.id === oldestRetained)).toBe(true);
+    s.destroy();
   });
 });
 
