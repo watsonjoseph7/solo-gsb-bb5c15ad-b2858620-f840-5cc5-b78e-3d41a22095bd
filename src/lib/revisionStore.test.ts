@@ -58,7 +58,12 @@ class FailingStorage extends MemStorage {
 }
 
 /** 读取单键原子状态文档。 */
-function readState(storage: Storage): { version: number; headId: string; revisions: Revision[] } {
+function readState(storage: Storage): {
+  version: number;
+  headId: string;
+  revisions: Revision[];
+  prunedRevisionIds?: string[];
+} {
   return JSON.parse(storage.getItem(STATE_STORAGE_KEY)!);
 }
 
@@ -382,6 +387,200 @@ describe('修订图祖先判定', () => {
     revs.set('x', { id: 'x', parentRevisionIds: ['gone'], clientId: 'c', plan: emptyPlan() });
     revs.set('y', { id: 'y', parentRevisionIds: ['gone'], clientId: 'c', plan: emptyPlan() });
     expect(relationOf('x', 'y', revs)).toBe('diverged');
+  });
+});
+
+describe('修订图裁剪与祖先边界（超过 400 上限后的 stale/分叉判定）', () => {
+  it('超过上限后从最旧修订开始裁剪，裁剪边界随单键状态原子持久化', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('r'));
+    // 创世 + 401 次提交 = 402 个修订 → 裁剪最旧的创世与 r-1
+    for (let i = 0; i < 401; i++) {
+      expect(s.commit(rootOnlyPlan(`p${i}`)).ok).toBe(true);
+    }
+    expect(s.head.id).toBe('r-401');
+    const state = readState(storage);
+    expect(state.version).toBe(2);
+    expect(state.headId).toBe('r-401');
+    expect(state.revisions).toHaveLength(400);
+    expect(state.revisions[0].id).toBe('r-2'); // 最旧的保留修订
+    expect(state.revisions.some((x) => x.id === GENESIS_REVISION_ID)).toBe(false);
+    expect(state.revisions.some((x) => x.id === 'r-1')).toBe(false);
+    // 裁剪边界记录了被裁掉的修订 id，并随同一文档原子持久化
+    expect(state.prunedRevisionIds).toEqual([GENESIS_REVISION_ID, 'r-1']);
+    expect(s.getRevision(GENESIS_REVISION_ID)).toBeUndefined();
+    expect(s.getRevision('r-1')).toBeUndefined();
+    expect(s.getRevision('r-2')).toBeDefined();
+    s.destroy();
+  });
+
+  it('重载后收到已被裁剪的祖先修订：判 stale 直接忽略，不误判分叉锁定', () => {
+    const storage = new MemStorage();
+    const s1 = openSync(storage, 'c1', rec(), counterUuid('r'));
+    for (let i = 0; i < 401; i++) s1.commit(rootOnlyPlan(`p${i}`));
+    s1.destroy();
+
+    // 重新打开（重载）：裁剪边界随单键状态恢复
+    const r2 = rec();
+    const s2 = openSync(storage, 'c2', r2, counterUuid('c2'));
+    expect(s2.head.id).toBe('r-401');
+    const stateBefore = storage.getItem(STATE_STORAGE_KEY);
+    const ingest = (rev: Revision) =>
+      (s2 as unknown as { ingest(rev: Revision): void }).ingest(rev);
+
+    // 旧标签页整份文档重播：已被裁剪的祖先（创世、r-1）与仍在图中的 r-2
+    ingest({ id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c-old', plan: emptyPlan() });
+    ingest({ id: 'r-1', parentRevisionIds: [GENESIS_REVISION_ID], clientId: 'c1', plan: rootOnlyPlan('p0') });
+    ingest({ id: 'r-2', parentRevisionIds: ['r-1'], clientId: 'c1', plan: rootOnlyPlan('p1') });
+
+    expect(s2.head.id).toBe('r-401'); // head 不动
+    expect(s2.inConflict).toBe(false); // 不误判分叉
+    expect(r2.conflicts).toHaveLength(0);
+    expect(r2.ff).toHaveLength(0); // 不快进
+    // 被裁剪的祖先不重新入库，状态无任何变化（无额外落盘）
+    expect(s2.getRevision(GENESIS_REVISION_ID)).toBeUndefined();
+    expect(s2.getRevision('r-1')).toBeUndefined();
+    expect(storage.getItem(STATE_STORAGE_KEY)).toBe(stateBefore);
+    s2.destroy();
+  });
+
+  it('基于被裁剪祖先的新修订不在边界内：仍按真实分叉进入冲突', () => {
+    const storage = new MemStorage();
+    const s1 = openSync(storage, 'c1', rec(), counterUuid('r'));
+    for (let i = 0; i < 401; i++) s1.commit(rootOnlyPlan(`p${i}`));
+    s1.destroy();
+
+    const r2 = rec();
+    const s2 = openSync(storage, 'c2', r2, counterUuid('c2'));
+    const ingest = (rev: Revision) =>
+      (s2 as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    // 旧标签页先重播被裁剪祖先（被忽略），再送达其在 r-1 之上的新编辑
+    ingest({ id: 'r-1', parentRevisionIds: [GENESIS_REVISION_ID], clientId: 'c1', plan: rootOnlyPlan('p0') });
+    ingest({ id: 'fork-1', parentRevisionIds: ['r-1'], clientId: 'c-old', plan: rootOnlyPlan('FORK') });
+    expect(s2.inConflict).toBe(true);
+    expect(r2.conflicts.map((c) => c.id)).toEqual(['fork-1']);
+    expect(s2.head.id).toBe('r-401'); // head 不动，等待人工合并
+    expect(s2.getRevision('fork-1')).toBeDefined(); // 分叉双方均保留
+    s2.destroy();
+  });
+
+  it('旧标签页整份文档重播（storage 事件路径）：被裁剪祖先 stale、其新编辑真实分叉', () => {
+    const storage = new MemStorage();
+    // 两个标签页各自独立频道（互不投递）：t2 停留在旧 head，t1 狂飙超过上限
+    const t1rec = rec();
+    const t2rec = rec();
+    const t1 = openSync(storage, 't1', t1rec, counterUuid('t1'), new FakeChannel('ch-t1'));
+    const t2 = openSync(storage, 't2', t2rec, counterUuid('t2'), new FakeChannel('ch-t2'));
+    expect(t2.commit(rootOnlyPlan('t2-base')).ok).toBe(true); // t2-1
+    // t1 当时收到过 t2-1，随后独自提交 401 次：创世、t2-1、t1-1 被裁剪
+    (t1 as unknown as { ingest(rev: Revision): void }).ingest(t2.head);
+    for (let i = 0; i < 401; i++) t1.commit(rootOnlyPlan(`t1-${i}`));
+    expect(t1.head.id).toBe('t1-401');
+    expect(t1.getRevision(GENESIS_REVISION_ID)).toBeUndefined();
+    expect(t1.getRevision('t2-1')).toBeUndefined();
+    const t1Head = t1.head.id;
+
+    // t2（仍停留在 t2-1）提交新编辑：其单键文档为 [创世, t2-1, t2-2]
+    expect(t2.commit(rootOnlyPlan('t2-new')).ok).toBe(true);
+    // t1 经 storage 事件路径逐个接收 t2 文档中的修订
+    const doc = readState(storage);
+    const t1Ingest = (rev: Revision) =>
+      (t1 as unknown as { ingest(rev: Revision): void }).ingest(rev);
+    for (const rev of doc.revisions) t1Ingest(rev);
+
+    // 创世与 t2-1 是已被裁剪的祖先 → stale 忽略；只有 t2-2 是真实分叉
+    expect(t1.head.id).toBe(t1Head);
+    expect(t1rec.ff.map((f) => f.id)).toEqual(['t2-1']); // 无新的快进
+    expect(t1rec.conflicts.map((c) => c.id)).toEqual(['t2-2']);
+    expect(t1.inConflict).toBe(true);
+    t1.destroy();
+    t2.destroy();
+  });
+
+  it('relationOf 凭裁剪边界判 stale；边界外的未知修订仍保守判分叉', () => {
+    const revs = new Map<string, Revision>();
+    const put = (id: string, parents: string[]) =>
+      revs.set(id, { id, parentRevisionIds: parents, clientId: 'c', plan: emptyPlan() });
+    // r2、r1 均已被裁剪：图中只剩 r3，其父指针指向缺口
+    put('r3', ['r2']);
+    const pruned = new Set([GENESIS_REVISION_ID, 'r1', 'r2']);
+    expect(relationOf('r3', 'r1', revs, pruned)).toBe('stale');
+    expect(relationOf('r3', 'r2', revs, pruned)).toBe('stale');
+    expect(relationOf('r3', GENESIS_REVISION_ID, revs, pruned)).toBe('stale');
+    expect(relationOf('r3', 'r3', revs, pruned)).toBe('same');
+    // 不在裁剪边界内的未知修订：父链缺口仍保守判分叉
+    expect(relationOf('r3', 'unknown', revs, pruned)).toBe('diverged');
+    // 不传裁剪边界时保持原有保守语义（父链缺口 → 分叉）
+    expect(relationOf('r3', 'r1', revs)).toBe('diverged');
+  });
+
+  it('触发裁剪的提交写入失败：修订、head 与裁剪边界整体回滚', () => {
+    const storage = new MemStorage();
+    const r = rec();
+    const s = openSync(storage, 'c1', r, counterUuid('r'));
+    for (let i = 0; i < 400; i++) s.commit(rootOnlyPlan(`p${i}`));
+    // 创世已被裁剪并记入边界
+    const before = readState(storage);
+    expect(before.revisions).toHaveLength(400);
+    expect(before.prunedRevisionIds).toEqual([GENESIS_REVISION_ID]);
+    expect(s.getRevision('r-1')).toBeDefined();
+    const headBefore = s.head.id;
+
+    vi.spyOn(storage, 'setItem').mockImplementation(() => {
+      const err = new Error('QuotaExceededError');
+      err.name = 'QuotaExceededError';
+      throw err;
+    });
+    const res = s.commit(rootOnlyPlan('overflow'));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe('storage-error');
+    expect(s.head.id).toBe(headBefore);
+    // r-1 的裁剪被回滚：仍在图中；失败的新修订未入库
+    expect(s.getRevision('r-1')).toBeDefined();
+    expect(s.getRevision('r-401')).toBeUndefined();
+    // 持久化状态（含裁剪边界）保持提交前
+    expect(readState(storage)).toEqual(before);
+    s.destroy();
+  });
+
+  it('兼容缺少裁剪边界字段的既有 version 2 文档：正常加载，边界从空累积', () => {
+    const storage = new MemStorage();
+    storage.setItem(
+      STATE_STORAGE_KEY,
+      JSON.stringify({
+        version: 2,
+        headId: 'leaf',
+        revisions: [
+          { id: GENESIS_REVISION_ID, parentRevisionIds: [], clientId: 'c', plan: emptyPlan() },
+          { id: 'leaf', parentRevisionIds: [GENESIS_REVISION_ID], clientId: 'c', plan: rootOnlyPlan('1') },
+        ],
+      }),
+    );
+    const r = rec();
+    const s = openSync(storage, 'c2', r, counterUuid('z'));
+    expect(s.head.id).toBe('leaf');
+    expect(r.warnings).toHaveLength(0);
+    // 后续提交照常写入边界字段（未发生裁剪时为空数组）
+    expect(s.commit(rootOnlyPlan('2')).ok).toBe(true);
+    expect(readState(storage).prunedRevisionIds).toEqual([]);
+    s.destroy();
+  });
+
+  it('裁剪边界自身有界：持续超限时边界记录数不超过上限', () => {
+    const storage = new MemStorage();
+    const s = openSync(storage, 'c1', rec(), counterUuid('r'));
+    // 创世 + 801 次提交 = 802 个修订 → 累计裁剪 402 个（创世、r-1..r-401）
+    for (let i = 0; i < 801; i++) s.commit(emptyPlan());
+    const state = readState(storage);
+    expect(state.revisions).toHaveLength(400);
+    // 边界只保留最近 400 条裁剪记录：最旧的（创世、r-1）已被挤出
+    expect(state.prunedRevisionIds).toHaveLength(400);
+    expect(state.prunedRevisionIds).toContain('r-401');
+    expect(state.prunedRevisionIds).toContain('r-2');
+    expect(state.prunedRevisionIds).not.toContain(GENESIS_REVISION_ID);
+    expect(state.prunedRevisionIds).not.toContain('r-1');
+    s.destroy();
   });
 });
 

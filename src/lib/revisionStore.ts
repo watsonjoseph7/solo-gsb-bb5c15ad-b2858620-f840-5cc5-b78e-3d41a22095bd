@@ -19,6 +19,11 @@
  *   - 当前 head 是收到修订的祖先 → 快进；
  *   - 收到修订是当前 head 的祖先 → 忽略；
  *   - 互不为祖先（或祖先链缺失无法证明）→ 分叉冲突，保留两份；
+ * - 修订全集超过上限时从最旧修订开始裁剪，被裁剪修订的 id 记入
+ *   **裁剪边界**（有界 FIFO），随单键状态原子持久化：旧标签页重播已被
+ *   裁剪的祖先修订时凭边界可证明其过时（stale，直接忽略），不再因父链
+ *   缺口误判为分叉而锁定编辑；基于被裁剪祖先的**新**修订不在边界内，
+ *   仍按真实分叉进入冲突；
  * - 冲突由用户显式选择后生成同时引用两个父版本的合并修订；合并写入失败时
  *   保持冲突锁定，不得解除锁定或广播失败修订。
  */
@@ -36,6 +41,11 @@ interface PersistedState {
   version: 2;
   headId: string;
   revisions: Revision[];
+  /**
+   * 裁剪边界：最近被裁剪的修订 id（按裁剪先后排序的有界 FIFO）。
+   * 既有 version 2 文档可缺省（按空边界兼容加载），写入时总会带上。
+   */
+  prunedRevisionIds?: string[];
 }
 
 /** 修订数组解析结果（新键与旧版双键共用）。 */
@@ -53,6 +63,13 @@ export const CHANNEL_NAME = 'ipv4-subnet-planner/revisions/v1';
 
 /** 修订全集上限，超出后从最早的修订开始裁剪（head 与冲突分支最后裁剪）。 */
 const MAX_REVISIONS = 400;
+
+/**
+ * 裁剪边界（最近被裁剪修订的 id 集合）上限。与修订全集同量级：足以覆盖
+ * 另一标签页整份文档（至多 MAX_REVISIONS 个修订）中全部被裁剪祖先的重播，
+ * 同时保证单键状态文档的持久化体积仍有界。
+ */
+const MAX_PRUNED_REVISION_IDS = MAX_REVISIONS;
 
 /** 所有客户端共享的空规划创世修订 id（内容恒定，无需随机）。 */
 export const GENESIS_REVISION_ID = 'genesis:empty-plan:v1';
@@ -95,13 +112,18 @@ export function isAncestor(
 /**
  * 按修订图判定 remote 相对当前 head 的关系。
  * 创世空规划使用全局固定 id，空存储的标签页之间自然收敛到同一节点。
+ * prunedRevisionIds 提供裁剪边界：remote 是已被裁剪的修订时，它本就是当前
+ * 图的历史祖先（否则不会被裁剪），可证明过时 → stale，不再因父链缺口
+ * 保守误判为分叉。不在边界内且父链缺失的未知修订仍保守判为分叉。
  */
 export function relationOf(
   headId: string,
   remoteId: string,
   revisions: ReadonlyMap<string, Revision>,
+  prunedRevisionIds?: ReadonlySet<string>,
 ): RevisionRelation {
   if (headId === remoteId) return 'same';
+  if (prunedRevisionIds?.has(remoteId)) return 'stale';
   if (isAncestor(headId, remoteId, revisions)) return 'fast-forward';
   if (isAncestor(remoteId, headId, revisions)) return 'stale';
   return 'diverged';
@@ -162,7 +184,9 @@ function parseRevisionsArray(items: unknown[]): ParsedRevisions {
 }
 
 /** 解析单键原子状态文档（version 2）。 */
-function parsePersistedState(raw: string): ParseResult<ParsedRevisions & { headId: unknown }> {
+function parsePersistedState(
+  raw: string,
+): ParseResult<ParsedRevisions & { headId: unknown; prunedRevisionIds: string[] }> {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -173,7 +197,12 @@ function parsePersistedState(raw: string): ParseResult<ParsedRevisions & { headI
     return { ok: false, error: '本地状态文档结构损坏' };
   }
   const parsed = parseRevisionsArray(json.revisions as unknown[]);
-  return { ok: true, value: { ...parsed, headId: json.headId } };
+  // 裁剪边界是可选的增量字段：既有 version 2 文档没有它，按空边界兼容；
+  // 非法条目静默丢弃（边界只是判定辅助，不影响修订数据本身的完整性）。
+  const prunedRevisionIds = Array.isArray(json.prunedRevisionIds)
+    ? [...new Set(json.prunedRevisionIds.filter((x): x is string => typeof x === 'string'))]
+    : [];
+  return { ok: true, value: { ...parsed, headId: json.headId, prunedRevisionIds } };
 }
 
 /** 解析旧版修订全集文档（version 1，双键时代）。 */
@@ -214,6 +243,12 @@ export class RevisionSync {
   private revisions = new Map<string, Revision>();
   /** 文档内的原始顺序，用于裁剪时从最早修订开始丢弃。 */
   private order: string[] = [];
+  /**
+   * 裁剪边界：最近被裁剪的修订 id（插入序即裁剪先后，有界 FIFO）。
+   * 随单键状态原子持久化，用于把“旧标签页重播已裁剪祖先”可证明地判为
+   * stale 而不是因父链缺口误判为分叉。
+   */
+  private prunedIds = new Set<string>();
   private headId: string;
   private readonly clientId: string;
   private readonly storage: Storage | null;
@@ -398,6 +433,12 @@ export class RevisionSync {
       // 重复投递（storage 事件与频道消息可能各来一次）：无需再判定。
       return;
     }
+    if (this.prunedIds.has(rev.id)) {
+      // 重播的是已被裁剪的祖先修订（如旧标签页整份文档经 storage 事件送达）：
+      // 凭裁剪边界可证明其过时，直接忽略——不重新入库（保持裁剪边界稳定），
+      // 更不能因父链缺口误判为分叉而锁定编辑。
+      return;
+    }
     if (this.conflictId !== null) {
       const conflictId = this.conflictId;
       // 在候选图（含新修订）上预判：对方是否已提交同时覆盖本页 head 与冲突
@@ -525,6 +566,11 @@ export class RevisionSync {
         this.revisions.set(rev.id, rev);
         this.order.push(rev.id);
       }
+      // 裁剪边界随单键状态恢复：重载后仍能识别旧标签页重播的已裁剪祖先。
+      for (const id of doc.value.prunedRevisionIds) {
+        // 防御：同时在图中的 id 以图为准（正常文档不会两者重叠）。
+        if (!this.revisions.has(id)) this.recordPruned(id);
+      }
       if (doc.value.badCount > 0) {
         warnings.push(`检测到 ${doc.value.badCount} 个损坏的修订快照，已忽略`);
       }
@@ -636,6 +682,7 @@ export class RevisionSync {
       headId: this.headId,
       conflictId: this.conflictId,
       pendingIds: [...this.pendingIds],
+      prunedIds: new Set(this.prunedIds),
     };
     mutate();
     const result = this.writeState(false);
@@ -645,6 +692,7 @@ export class RevisionSync {
       this.headId = snapshot.headId;
       this.conflictId = snapshot.conflictId;
       this.pendingIds = snapshot.pendingIds;
+      this.prunedIds = snapshot.prunedIds;
       return result;
     }
     afterCommit?.();
@@ -665,6 +713,7 @@ export class RevisionSync {
       version: 2,
       headId: this.headId,
       revisions: this.order.map((id) => this.revisions.get(id)!),
+      prunedRevisionIds: [...this.prunedIds],
     };
     try {
       this.storage.setItem(STATE_STORAGE_KEY, JSON.stringify(state));
@@ -687,7 +736,11 @@ export class RevisionSync {
     return { ok: true };
   }
 
-  /** 超出上限时按文档顺序从最早修订开始裁剪；head 与冲突分支最后被丢弃。 */
+  /**
+   * 超出上限时按文档顺序从最早修订开始裁剪；head 与冲突分支最后被丢弃。
+   * 被裁剪修订的 id 记入裁剪边界（随单键状态原子持久化）：它们都是当前图的
+   * 历史祖先，之后被旧标签页重播时可证明过时（stale）而非误判分叉。
+   */
   private prune(): void {
     while (this.order.length > MAX_REVISIONS) {
       const protectedId = this.conflictId;
@@ -695,6 +748,22 @@ export class RevisionSync {
       if (idx < 0) break;
       const [removed] = this.order.splice(idx, 1);
       this.revisions.delete(removed);
+      this.recordPruned(removed);
+    }
+  }
+
+  /**
+   * 记录一个被裁剪的修订 id。边界自身有界（FIFO 挤出最旧记录），
+   * 持久化体积不突破上限；最旧记录被挤出后，对其的重播退化为保守分叉，
+   * 仅影响极端陈旧的标签页。
+   */
+  private recordPruned(id: string): void {
+    this.prunedIds.delete(id); // 防御重复记录：保持唯一并视为最新裁剪
+    this.prunedIds.add(id);
+    while (this.prunedIds.size > MAX_PRUNED_REVISION_IDS) {
+      const first = this.prunedIds.values().next();
+      if (first.done) break;
+      this.prunedIds.delete(first.value);
     }
   }
 }
